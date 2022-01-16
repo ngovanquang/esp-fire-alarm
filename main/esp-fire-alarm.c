@@ -57,12 +57,15 @@ static const char *longitude = "105.834160";
 static char strftime_buf[64];
 static const int DelayMS = 3000;
 static int msg_id;
+static bool led_status = 0;
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 TaskHandle_t publishMessageHandle = NULL;
 TaskHandle_t dhtTaskHandle = NULL;
-TaskHandle_t mq135TaskHandle = NULL;
+TaskHandle_t mqTaskHandle = NULL;
 TaskHandle_t syncTimeHandle = NULL;
+TaskHandle_t turnOnWarningHandle = NULL;
+TaskHandle_t detectFireHandle = NULL;
 QueueHandle_t queue1; // store dht22 data
 QueueHandle_t queue2; // store gas sensor data
 /**
@@ -110,7 +113,7 @@ static void read_mq_data(void* args)
     {
         read_mq_data_callback();
         sprintf(txbuff, "\"ch4\":%.f,\"co\":%.f,\"lpg\":%.f", get_ppm_ch4(), get_ppm_co(), get_ppm_lpg());
-        
+        if (get_ppm_ch4() > 5000) vTaskResume(turnOnWarningHandle);
         if (xQueueSend(queue2, (void*)txbuff, (TickType_t)0) != 1)
         {
             printf("could not sended this message = %s \n", txbuff);
@@ -147,17 +150,61 @@ static void recv_dht22_data(void* arg)
 }
 
 /**
- * @brief Subscribe message
+ * @brief ham thuc hien chuc nang canh bao
+ * 
+ */
+static void turn_on_warning_task(void) {
+    int cnt = 0;
+    vTaskSuspend(NULL);
+    while(1) {
+        cnt++;
+        if (cnt/2 == 10){
+            cnt = 0;
+            gpio_set_level(2, 0);
+            gpio_set_level(5, 0);
+            gpio_set_level(18, 0);
+            vTaskSuspend(turnOnWarningHandle);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        led_status = !led_status;
+        gpio_set_level(2, led_status);
+        gpio_set_level(5, led_status);
+        gpio_set_level(18, 1);
+    }
+}
+
+/**
+ * @brief phát hiện lửa cháy
+ * 
+ */
+static void detect_fire_task(void) {
+    vTaskSuspend(NULL);
+    while(1) {
+        if(gpio_get_level(19) == 0) {
+            printf("fire is detecting...\n");
+            vTaskResume(turnOnWarningHandle);
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+/**
+ * @brief xu ly data nhan duoc tu subscribe
  * 
  *
 */
-static void process_msg_from_subscribe (char *msg) {
-    
-    if (strcmp(msg,"off")) {
+static void process_msg_from_subscribe (char *msg, int data_len) {
+    char str[data_len];
+    strncpy(str, msg, data_len);
+    str[data_len] = '\0';
+    if (strcmp(str,"off") == 0) {
+        printf("%s\n", str);
+        printf("led is off\n");
         gpio_set_level(2, 0);
-    } else if (strcmp(msg, "on")) {
-        gpio_set_level(2, 1);
+    } else if (strcmp(str,"on") == 0) {
+        vTaskResume(turnOnWarningHandle);
     }
+
 }
 
 /**
@@ -165,7 +212,7 @@ static void process_msg_from_subscribe (char *msg) {
  * 
  * @param args 
  */
-static void publish_message_task(char *args)
+void publish_message_task(char *args)
 {
     char rxbuff1[50];
     char rxbuff2[50];
@@ -181,8 +228,8 @@ static void publish_message_task(char *args)
         {
             printf("got a data from queue2 === %s \n", rxbuff2);
         }
-        sprintf(buff, "{\"deviceId\":\"%s\",\"deviceType\":\"%s\",\"data\":{%s,\"location\":{\"latitude\":\"%s\",\"longitude\":\"%s\"},\"time\":\"%s\",%s},}", deviceId, deviceType, rxbuff1, latitude, longitude, strftime_buf, rxbuff2);
-        msg_id = esp_mqtt_client_publish(mqtt_client, "/topic/qos1", buff, 0, 1, 0);
+        sprintf(buff, "{\"deviceId\":\"%s\",\"deviceType\":\"%s\",\"data\":{%s,\"location\":{\"latitude\":\"%s\",\"longitude\":\"%s\"},\"time\":\"%s\",%s}}", deviceId, deviceType, rxbuff1, latitude, longitude, strftime_buf, rxbuff2);
+        msg_id = esp_mqtt_client_publish(mqtt_client, "/topic/firealarm/01", buff, 0, 1, 0);
         vTaskDelay(DelayMS / portTICK_PERIOD_MS);
     }
 }
@@ -212,9 +259,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        msg_id = esp_mqtt_client_subscribe(mqtt_client, "/topic/led/qos2", 2);
+        msg_id = esp_mqtt_client_subscribe(mqtt_client, "/topic/firealarm/command/01", 2);
         vTaskResume(publishMessageHandle);
         vTaskResume(dhtTaskHandle);
+        vTaskResume(detectFireHandle);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -234,7 +282,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
-        process_msg_from_subscribe(event->data);
+        process_msg_from_subscribe(event->data, event->data_len);
+        memset(event->data, 0, event->data_len);
+
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -281,9 +331,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    gpio_pad_select_gpio(2);
     gpio_set_direction(2, GPIO_MODE_OUTPUT);
-
+    gpio_set_direction(5, GPIO_MODE_OUTPUT);
+    gpio_set_direction(18, GPIO_MODE_OUTPUT);
+    gpio_set_direction(19, GPIO_MODE_INPUT);
     // Connect to wifi
     ESP_ERROR_CHECK(example_connect());
     mqtt_app_start();
@@ -291,5 +342,7 @@ void app_main(void)
     xTaskCreate(sync_time, "sync time", 4096, NULL, 10, &syncTimeHandle);
     xTaskCreate(recv_dht22_data, "dht data task", 4096, NULL, 10, &dhtTaskHandle);
     xTaskCreate(publish_message_task, "publish message", 4096, NULL, 10, &publishMessageHandle);
-    xTaskCreate(read_mq_data, "read mq135 data", 2048, NULL, 10, mq135TaskHandle);
+    xTaskCreate(read_mq_data, "read mq data", 2048, NULL, 10, &mqTaskHandle);
+    xTaskCreate(turn_on_warning_task, "turn on warning", 2048, NULL, 10, &turnOnWarningHandle);
+    xTaskCreate(detect_fire_task, "detect fire", 1024, NULL, 10, &detectFireHandle);
 }
